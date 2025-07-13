@@ -1,7 +1,7 @@
 import streamlit as st
 import json
 from typing import Dict, List, Optional
-from config import LLMProvider, DEFAULT_AGENTS, get_env_api_key, get_ui_text
+from src.config import LLMProvider, DEFAULT_AGENTS, get_env_api_key, get_ui_text
 from src.utils.llms import LLMManager
 from src.models import DebateState
 from src.constants import LLM_MODEL_LIST

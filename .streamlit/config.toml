@@ -1,0 +1,20 @@
+[server]
+# Increase message size limit to handle larger debates
+maxMessageSize = 500
+
+# Disable file watching for better performance
+fileWatcherType = "none"
+
+# Enable faster rerun
+enableCORS = false
+
+[browser]
+# Don't gather usage stats to reduce overhead
+gatherUsageStats = false
+
+[theme]
+# Optional: Set a nice theme
+primaryColor = "#1f77b4"
+backgroundColor = "#ffffff"
+secondaryBackgroundColor = "#f0f2f6"
+textColor = "#262730"

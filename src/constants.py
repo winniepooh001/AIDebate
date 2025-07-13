@@ -1,13 +1,13 @@
 
 LLM_MODEL_LIST = {
     "openai": [
-        "GPT-4.5",
-         "GPT-4.1", "GPT-4.1-mini", "GPT-4.1-nano",
+        "gpt-4.5",
+         "gpt-4.1", "gpt-4.1-mini", "gpt-4.1-nano",
          "o4-mini", "o4-mini-high",
          "o3", "o3-mini", "o3-mini-high", "o3-pro",
          "o1", "o1-mini", "o1-pro", "o1-preview",
-         "GPT-4o", "GPT-4o-mini",
-         "GPT-3.5"
+         "gpt4o", "gpt-4o-mini",
+         "gpt-3.5"
     ],
     "deepseek": ["deepseek-chat",
          "deepseek-reasoner",

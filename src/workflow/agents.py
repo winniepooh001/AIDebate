@@ -5,7 +5,7 @@ from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.output_parsers import StrOutputParser
 from src.config import AgentConfig, LANGUAGE_INSTRUCTIONS
 from src.models import DebateState, AgentResponse
-from src.utils.llm_manager import LLMManager
+from src.utils.llms import LLMManager
 
 
 class DebateAgent:
