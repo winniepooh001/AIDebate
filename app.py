@@ -41,6 +41,8 @@ def initialize_session_state():
         st.session_state.is_processing = False
     if 'message_count' not in st.session_state:
         st.session_state.message_count = 0
+    if 'step_running' not in st.session_state:
+        st.session_state.step_running = False
 
 
 def status_callback(message: str, is_processing: bool = False):
@@ -119,6 +121,8 @@ async def run_debate_step(orchestrator):
 
     logger.warning("⚠️ Cannot run step: No orchestrator or state")
     return False
+
+
 
 
 def main():
@@ -209,16 +213,26 @@ def main():
                         st.error(f"Failed to start debate: {str(e)}")
 
         with col_btn2:
-            if st.button(ui_text["next_round"], disabled=not st.session_state.debate_running):
+            step_disabled = not st.session_state.debate_running or st.session_state.step_running
+            if st.button(ui_text["next_round"], disabled=step_disabled):
                 if st.session_state.orchestrator:
                     logger.info("👆 User triggered next round manually")
+                    # Use direct async execution instead of threading to avoid loop conflicts
+                    st.session_state.step_running = True
+                    st.session_state.is_processing = True
+                    
                     with st.spinner("Running next round..."):
-                        result = asyncio.run(run_debate_step(st.session_state.orchestrator))
-                        if not result:
-                            st.session_state.debate_running = False
-                            st.session_state.auto_run = False
-                            st.success("🎉 Debate completed!")
-                        time.sleep(0.1)  # Small delay to show the spinner
+                        try:
+                            result = asyncio.run(run_debate_step(st.session_state.orchestrator))
+                            if not result:
+                                st.session_state.debate_running = False
+                                st.session_state.auto_run = False
+                                st.success("🎉 Debate completed!")
+                        except Exception as e:
+                            st.error(f"Step failed: {e}")
+                        finally:
+                            st.session_state.step_running = False
+                            st.session_state.is_processing = False
                     st.rerun()
 
         with col_btn3:
@@ -243,6 +257,10 @@ def main():
             else:
                 logger.info("⏸️ Auto-run disabled by user")
 
+        # Show processing status
+        if st.session_state.step_running:
+            st.warning("🔄 LLM is processing in background...")
+        
         # Debug: Manual trigger for auto-run
         if st.session_state.debate_running and not st.session_state.is_processing:
             if st.button("🚀 Trigger Next Round Now", help="Manual trigger if auto-run isn't working"):
@@ -276,41 +294,12 @@ def main():
             limited_state = type('LimitedState', (), {})()
             limited_state.messages = display_messages
             render_message_display(limited_state)
-            run = auto_run_enabled
 
-        # Status display
-        debate_state = st.session_state.orchestrator.state if st.session_state.orchestrator else None
-        render_status_display(
-            debate_state,
-            st.session_state.current_status,
-            st.session_state.is_processing
-        )
-
-        # Display debate messages (with pagination for large debates)
-        if debate_state:
-            # Check if we have new messages
-            current_message_count = len(debate_state.messages)
-            if current_message_count != st.session_state.message_count:
-                st.session_state.message_count = current_message_count
-
-            # Only show recent messages to avoid websocket size limit
-            max_messages = 50  # Limit to prevent websocket issues
-            if current_message_count > max_messages:
-                st.warning(f"Showing last {max_messages} messages (total: {current_message_count})")
-                display_messages = debate_state.messages[-max_messages:]
-            else:
-                display_messages = debate_state.messages
-
-            # Create a temporary state object with limited messages
-            limited_state = type('LimitedState', (), {})()
-            limited_state.messages = display_messages
-            render_message_display(limited_state)
-
-        # Auto-run logic with improved triggering
+        # Auto-run logic with direct async execution (no threading)
         if (st.session_state.auto_run and
                 st.session_state.debate_running and
                 st.session_state.orchestrator and
-                not st.session_state.is_processing):
+                not st.session_state.step_running):
 
             # Initialize auto-run timing
             if 'last_auto_run' not in st.session_state:
@@ -318,34 +307,38 @@ def main():
 
             current_time = time.time()
 
+            # Show countdown
+            elapsed = current_time - st.session_state.last_auto_run
+            remaining = max(0, debate_settings["round_delay"] - elapsed)
+            if remaining > 0:
+                st.write(f"⏰ Next auto step in: {remaining:.1f}s")
+
             # Check if enough time has passed since last auto-run
             if current_time - st.session_state.last_auto_run >= debate_settings["round_delay"]:
                 st.session_state.last_auto_run = current_time
-
-                # Show a progress indicator during auto-run
-                progress_placeholder = st.empty()
-                with progress_placeholder:
-                    st.info("🔄 Auto-running next round...")
-
+                st.session_state.step_running = True
+                st.session_state.is_processing = True
+                
+                # Run step directly without threading
+                with st.spinner("🔄 Auto-running next round..."):
                     try:
                         result = asyncio.run(run_debate_step(st.session_state.orchestrator))
-
                         if not result:
                             st.session_state.debate_running = False
                             st.session_state.auto_run = False
                             st.success("🎉 Debate completed!")
-
-                        # Clear the progress indicator
-                        progress_placeholder.empty()
-
-                        # Small delay to prevent too rapid updates
-                        time.sleep(0.5)
-                        st.rerun()
-
                     except Exception as e:
-                        progress_placeholder.empty()
-                        st.error(f"Auto-run failed: {str(e)}")
+                        st.error(f"Auto-run failed: {e}")
                         st.session_state.auto_run = False
+                    finally:
+                        st.session_state.step_running = False
+                        st.session_state.is_processing = False
+                st.rerun()
+
+        # Continuous refresh when auto-run is active
+        if (st.session_state.auto_run and st.session_state.debate_running):
+            time.sleep(0.5)  # Check for auto-run timing
+            st.rerun()
 
     with col2:
         # Human interruption panel
@@ -358,6 +351,23 @@ def main():
             if action == "rerun":
                 # Stop auto-run temporarily when human interrupts
                 st.session_state.auto_run = False
+                # Trigger next step immediately to process human input
+                if st.session_state.orchestrator and not st.session_state.step_running:
+                    st.session_state.step_running = True
+                    st.session_state.is_processing = True
+                    
+                    with st.spinner("Processing human input..."):
+                        try:
+                            result = asyncio.run(run_debate_step(st.session_state.orchestrator))
+                            if not result:
+                                st.session_state.debate_running = False
+                                st.session_state.auto_run = False
+                                st.success("🎉 Debate completed!")
+                        except Exception as e:
+                            st.error(f"Processing failed: {e}")
+                        finally:
+                            st.session_state.step_running = False
+                            st.session_state.is_processing = False
                 st.rerun()
 
         # Debate summary

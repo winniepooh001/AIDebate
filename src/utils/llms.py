@@ -4,8 +4,11 @@ from langchain_openai import ChatOpenAI
 from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_deepseek import ChatDeepSeek
 from langchain_core.language_models.base import BaseLanguageModel
+from langchain_community.tools import GoogleSearchRun
+from langchain_community.utilities import GoogleSearchAPIWrapper
 from src.config import LLMProvider, get_env_api_key
 from src.utils.logger import logger
+import os
 
 class LLMManager:
     def __init__(self):
@@ -15,6 +18,7 @@ class LLMManager:
         self.provider_order: List[LLMProvider] = []
         self.provider_stats: Dict[LLMProvider, Dict] = {}
 
+
     def add_provider(self, provider_type: LLMProvider, **kwargs) -> bool:
         """Add an LLM provider with configuration"""
         try:
@@ -22,24 +26,27 @@ class LLMManager:
             if not api_key:
                 raise ValueError(f"{provider_type.value} API key not found")
 
+            llm = None
             if provider_type == LLMProvider.OPENAI:
-                self.providers[provider_type] = ChatOpenAI(
+                llm = ChatOpenAI(
                     api_key=api_key,
                     model=kwargs.get('model', 'gpt-4o-mini'),
                     temperature=kwargs.get('temperature', 0.7)
                 )
             elif provider_type == LLMProvider.GEMINI:
-                self.providers[provider_type] = ChatGoogleGenerativeAI(
+                llm = ChatGoogleGenerativeAI(
                     google_api_key=api_key,
                     model=kwargs.get('model', 'gemini-2.5-pro'),
                     temperature=kwargs.get('temperature', 0.7)
                 )
             elif provider_type == LLMProvider.DEEPSEEK:
-                self.providers[provider_type] = ChatDeepSeek(
+                llm = ChatDeepSeek(
                     api_key=api_key,
                     model=kwargs.get('model', 'deepseek-chat'),
                     temperature=kwargs.get('temperature', 0.7)
                 )
+
+            self.providers[provider_type] = llm
 
             self.provider_order.append(provider_type)
             self.provider_stats[provider_type] = {
@@ -99,3 +106,4 @@ class LLMManager:
     def is_provider_available(self, provider_name: str) -> bool:
         """Check if a provider is available"""
         return provider_name in self.get_available_providers()
+    

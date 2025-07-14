@@ -2,10 +2,6 @@ import os
 from enum import Enum
 from typing import Dict, List
 from dataclasses import dataclass
-from dotenv import load_dotenv
-
-# Load environment variables
-load_dotenv('D:\YuanYuanGu\Documents\Projects\.env')
 
 class LLMProvider(Enum):
     OPENAI = "openai"
@@ -17,6 +13,7 @@ class DebatePhase(Enum):
     PROPOSAL = "proposal"
     CRITIQUE = "critique"
     MODERATION = "moderation"
+    ARCHITECTURE = "architecture"
     CONSENSUS = "consensus"
     HUMAN_INPUT = "human_input"
     COMPLETE = "complete"

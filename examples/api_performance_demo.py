@@ -9,10 +9,10 @@ from enum import Enum
 import threading
 from queue import Queue
 import uuid
-from dotenv import load_dotenv
+from src.utils.load_env import load_all_env
 
 # Load environment variables
-load_dotenv()
+load_all_env()
 
 # LangChain imports
 from langchain_openai import ChatOpenAI
