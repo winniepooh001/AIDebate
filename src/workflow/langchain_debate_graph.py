@@ -14,6 +14,76 @@ from src.utils.llms import LLMManager
 from src.utils.logger import logger
 
 
+def _extract_content_from_response(response):
+    """
+    Extract content from LLM response, handling both regular responses and tool-enabled responses.
+    
+    When search tools are bound to LLMs using bind_tools(), the response structure changes:
+    - Regular response: response.content contains the text
+    - Tool-enabled response: response.content may be empty, and tool_calls contain the search queries
+    
+    For tool responses, we need to execute the tools and get a follow-up response.
+    This function handles both cases to ensure content is properly extracted.
+    """
+    try:
+        # First try the standard content attribute for regular responses
+        if hasattr(response, 'content') and response.content and response.content.strip():
+            return response.content
+        
+        # If we have tool calls but no content, the LLM is trying to use tools
+        # In this case, we should return a descriptive message about what the LLM is trying to do
+        if hasattr(response, 'tool_calls') and response.tool_calls:
+            tool_descriptions = []
+            for tool_call in response.tool_calls:
+                tool_name = tool_call.get('name', 'unknown_tool')
+                if tool_name == 'tavily_search_results_json':
+                    args = tool_call.get('args', {})
+                    query = args.get('query', 'unknown query')
+                    tool_descriptions.append(f"搜索: {query}")
+                elif 'search' in tool_name.lower():
+                    args = tool_call.get('args', {})
+                    query = args.get('query', args.get('q', 'unknown query'))
+                    tool_descriptions.append(f"搜索: {query}")
+                else:
+                    tool_descriptions.append(f"工具调用: {tool_name}")
+            
+            if tool_descriptions:
+                # Return a descriptive message about what search is happening
+                search_info = "正在进行以下搜索以获取最新信息:\n• " + "\n• ".join(tool_descriptions)
+                search_info += "\n\n基于搜索结果，我将提供更详细和准确的分析..."
+                return search_info
+        
+        # Check for text attribute (some LangChain responses use this)
+        if hasattr(response, 'text') and response.text:
+            return response.text
+            
+        # If content exists but is empty, check additional_kwargs
+        if hasattr(response, 'additional_kwargs') and response.additional_kwargs:
+            content = response.additional_kwargs.get('content', '')
+            if content and content.strip():
+                return content
+        
+        # Check if it's a message-style response
+        if hasattr(response, 'messages') and response.messages:
+            for message in reversed(response.messages):  # Check from last to first
+                if hasattr(message, 'content') and message.content and message.content.strip():
+                    return message.content
+        
+        # If we have content attribute but it's empty, and no tool calls, something went wrong
+        if hasattr(response, 'content'):
+            return response.content if response.content else "LLM响应为空，可能是配置问题。"
+            
+        # Last resort: convert response to string, but avoid showing technical details
+        response_str = str(response)
+        if len(response_str) > 200:  # If it's too long, it's probably technical details
+            return "LLM响应格式异常，请检查配置。"
+        return response_str
+        
+    except Exception as e:
+        logger.warning(f"Error extracting content from response: {e}")
+        return f"提取响应内容时出错: {str(e)}"
+
+
 class DebatePhase(Enum):
     WAITING_FOR_TOPIC = "waiting_for_topic"
     EXTRACTING_REQUIREMENTS = "extracting_requirements"
@@ -41,6 +111,10 @@ class GraphState(TypedDict):
     messages: Annotated[List[DebateMessage], operator.add]
     requirements: str
     perspectives: List[str]
+    evidence_types: List[str]
+    action_framework: str
+    focus_questions: List[str]
+    debate_rules: dict
     user_input: Optional[str]
     acknowledgment: str
     response: str
@@ -81,6 +155,133 @@ class LangChainDebateOrchestrator:
             return self.llm_manager.providers[first_provider]
         else:
             raise ValueError("No LLM providers configured")
+    
+    def _get_base_llm(self):
+        """Get the base LLM without any tools bound"""
+        if self.llm_manager.provider_order:
+            first_provider = self.llm_manager.provider_order[0]
+            # Get the base LLM configuration and create a clean instance without tools
+            provider_config = self.llm_manager.get_provider_config(first_provider)
+            
+            # Import the LLM classes directly to create clean instances
+            from langchain_openai import ChatOpenAI
+            from langchain_google_genai import ChatGoogleGenerativeAI
+            from langchain_deepseek import ChatDeepSeek
+            from src.config import LLMProvider, get_env_api_key
+            
+            api_key = get_env_api_key(first_provider)
+            
+            if first_provider == LLMProvider.OPENAI:
+                return ChatOpenAI(
+                    api_key=api_key,
+                    model=provider_config.get('model', 'gpt-4o-mini'),
+                    temperature=provider_config.get('temperature', 0.7)
+                )
+            elif first_provider == LLMProvider.GEMINI:
+                return ChatGoogleGenerativeAI(
+                    google_api_key=api_key,
+                    model=provider_config.get('model', 'gemini-2.5-pro'),
+                    temperature=provider_config.get('temperature', 0.7)
+                )
+            elif first_provider == LLMProvider.DEEPSEEK:
+                return ChatDeepSeek(
+                    api_key=api_key,
+                    model=provider_config.get('model', 'deepseek-chat'),
+                    temperature=provider_config.get('temperature', 0.7)
+                )
+        else:
+            raise ValueError("No LLM providers configured")
+    
+    def _invoke_llm(self, prompt, use_search=False):
+        """
+        Invoke LLM with optional search tools.
+        
+        Args:
+            prompt: The prompt to send to the LLM
+            use_search: Whether to enable search tools for this call
+        """
+        try:
+            if use_search:
+                # Use the tool-enabled LLM for search
+                llm = self._get_llm()
+                logger.info("🔍 Using LLM with search tools enabled")
+            else:
+                # Use clean LLM without tools for regular debate responses
+                llm = self._get_base_llm()
+                logger.info("💭 Using base LLM without search tools")
+            
+            response = llm.invoke(prompt)
+            
+            # Check if we have tool calls but no content (only for search-enabled calls)
+            if (use_search and hasattr(response, 'tool_calls') and response.tool_calls and 
+                (not hasattr(response, 'content') or not response.content or not response.content.strip())):
+                
+                logger.info(f"🔍 LLM made {len(response.tool_calls)} tool calls, executing tools...")
+                
+                # Execute the search tools
+                search_results = []
+                for tool_call in response.tool_calls:
+                    tool_name = tool_call.get('name', 'unknown')
+                    if tool_name == 'tavily_search_results_json':
+                        try:
+                            # Import and execute Tavily search
+                            from langchain_community.tools.tavily_search import TavilySearchResults
+                            import os
+                            
+                            if os.getenv("TAVILY_API_KEY"):
+                                search_tool = TavilySearchResults(max_results=3)
+                                args = tool_call.get('args', {})
+                                query = args.get('query', '')
+                                
+                                if query:
+                                    logger.info(f"🔍 Executing search for: {query}")
+                                    search_result = search_tool.invoke(query)
+                                    search_results.append(f"搜索查询: {query}\n搜索结果: {search_result}")
+                                else:
+                                    search_results.append("搜索查询为空")
+                            else:
+                                search_results.append(f"TAVILY_API_KEY 未配置，无法搜索: {tool_call.get('args', {}).get('query', '')}")
+                        except Exception as e:
+                            logger.warning(f"Search execution failed: {e}")
+                            query = tool_call.get('args', {}).get('query', 'unknown')
+                            search_results.append(f"搜索失败: {query} (错误: {str(e)})")
+                
+                # If we have search results, make a follow-up call with the results
+                if search_results:
+                    search_context = "\n\n".join(search_results)
+                    
+                    # Create follow-up prompt with search results
+                    followup_prompt = f"""基于以下搜索结果，请提供详细分析：
+
+{search_context}
+
+原始问题/提示：
+{prompt}
+
+请基于搜索结果提供完整的回答，并引用相关信息。"""
+                    
+                    logger.info("🔍 Making follow-up LLM call with search results...")
+                    # Use base LLM for follow-up to avoid recursive tool calls
+                    base_llm = self._get_base_llm()
+                    final_response = base_llm.invoke(followup_prompt)
+                    
+                    logger.info("✅ Search-enhanced response generated")
+                    return final_response
+                else:
+                    # No search results, create fallback response
+                    class MockResponse:
+                        def __init__(self, content):
+                            self.content = content
+                    
+                    return MockResponse("搜索工具配置有误，基于现有知识回答问题。")
+            
+            return response
+            
+        except Exception as e:
+            logger.error(f"Error invoking LLM: {e}")
+            # Fallback to base LLM without tools
+            base_llm = self._get_base_llm()
+            return base_llm.invoke(prompt)
 
     def create_graph(self) -> StateGraph:
         """Create the LangChain debate workflow graph"""
@@ -88,6 +289,7 @@ class LangChainDebateOrchestrator:
 
         # Add nodes
         graph.add_node("extract_requirements", self._extract_requirements_node)
+        graph.add_node("generate_perspectives", self._generate_perspectives_node)
         graph.add_node("process_input", self._process_input_node)
         graph.add_node("debate_round", self._debate_round_node)
         graph.add_node("moderator_decision", self._moderator_decision_node)
@@ -96,13 +298,13 @@ class LangChainDebateOrchestrator:
         # Define flow with conditional routing
         graph.set_entry_point("extract_requirements")
         
-        # Flow: Requirements extraction stays as end point, we'll handle transitions manually
-        # The graph structure is simpler - each node can be invoked independently
+        # Flow: Requirements -> Perspectives -> Wait for Input
+        graph.add_edge("extract_requirements", "generate_perspectives")
         
-        # Entry points for different phases
+        # After perspectives generation, decide next step
         graph.add_conditional_edges(
-            "extract_requirements",
-            self._decide_after_requirements,
+            "generate_perspectives",
+            self._decide_after_perspectives,
             {
                 "wait_input": END,  # Stop and wait for user input
                 "process": "process_input"  # If input already available
@@ -158,26 +360,21 @@ class LangChainDebateOrchestrator:
 
         Extract and list:
         1. Underlying assumptions (up to 5)
-        2. Potential viewpoints or perspectives. The perspective and view point is dependent on the top
-            (i.e. a debate topic such as are you for or against coffe would just have 2 perspective for, against, 
-            a technical debate or product debate may involve expert opinion, market specialist, solution architect,
-            other personal stuff maybe have a critiquer, a support, and a pacifier etc.) 
-        3. Questions that need clarification from the user (if any) up to 4
+        2. Questions that need clarification from the user (if any) up to 4
 
         Be thorough but concise. Provide your answer in a json format
         **OUTPUT FORMAT**
         {{
             "Assumptions": ['assumption 1', 'assumption 2'],
-            "Perspectives":[“optimist", "devil's advocate", "market analyst"... ],
             "Clarifying Questions": [], 
         }}
         """
 
         try:
-            llm = self._get_llm()
-            response = llm.invoke(prompt)
+            # Requirements analysis focuses on understanding topic structure, not current data
+            response = self._invoke_llm(prompt, use_search=False)
             
-            requirements_content = response.content
+            requirements_content = _extract_content_from_response(response)
             
             # Create requirements message
             requirements_message = DebateMessage(
@@ -190,25 +387,13 @@ class LangChainDebateOrchestrator:
             self._update_status("✅ Requirements extracted. Waiting for your input...", False)
             logger.info("✅ Requirements extraction completed")
             
-            # Parse perspectives from JSON
-            perspectives = []
-            try:
-                import json
-                start_idx = requirements_content.find('{')
-                end_idx = requirements_content.rfind('}') + 1
-                if start_idx != -1 and end_idx > start_idx:
-                    json_str = requirements_content[start_idx:end_idx]
-                    parsed_data = json.loads(json_str)
-                    perspectives = parsed_data.get("Perspectives", [])
-            except:
-                perspectives = ["Optimist", "Skeptic", "Pragmatist"]  # Fallback
+            logger.info("✅ Requirements extraction completed, moving to perspective generation")
             
             return {
                 "requirements": requirements_content,
-                "perspectives": perspectives,
-                "current_phase": DebatePhase.WAITING_FOR_INPUT,
+                "current_phase": DebatePhase.EXTRACTING_REQUIREMENTS,
                 "messages": [requirements_message],
-                "next_action": "wait_for_input"
+                "next_action": "generate_perspectives"
             }
             
         except Exception as e:
@@ -224,11 +409,149 @@ class LangChainDebateOrchestrator:
             
             return {
                 "requirements": "",
-                "perspectives": ["Optimist", "Skeptic", "Pragmatist"],  # Fallback
                 "current_phase": DebatePhase.WAITING_FOR_INPUT,
                 "messages": [error_message],
                 "next_action": "wait_for_input"
             }
+
+    def _generate_perspectives_node(self, state: GraphState) -> Dict[str, Any]:
+        """Stage 1: Generate dynamic perspectives and debate framework"""
+        logger.info("🎭 Generating perspectives and debate framework...")
+        self._update_status("🎭 Analyzing topic to generate dynamic debate perspectives...", True)
+
+        prompt = f"""
+**Role**: Debate Architect  
+**Task**: For the user's topic: "{state['topic']}", generate a structured debate framework.
+
+Please respond in {state['language']}.
+
+Requirements from analysis: {state.get('requirements', '')}
+
+Generate:  
+1. **Core Conflict**: Identify 2-4 naturally opposing perspectives with specific expertise/viewpoints
+2. **Evidence Standards**:  
+   - Required: Scientific studies, historical precedents, empirical data, expert analysis
+   - Forbidden: Anecdotes without citations, unsupported opinions
+3. **Action Framework**:  
+   - Convert abstract concepts to 3-5 concrete, measurable actions  
+4. **Debate Rules**:  
+   - Round 1: Propose actions with evidence  
+   - Round 2: Challenge weakest evidence in opponent's claims  
+   - Round 3: Address ethical/implementation trade-offs  
+5. **Focus Questions**: 2-3 key questions that drive deeper analysis
+
+**OUTPUT FORMAT** (JSON):
+{{
+  "perspectives": [
+    "Name: Core Belief (e.g., 心理学家: 专注心理健康影响)",
+    "Name: Core Belief (e.g., 社会学家: 关注社会结构因素)"
+  ],
+  "required_evidence_types": ["心理学研究", "社会调查数据", "历史案例分析"],
+  "action_framework": "Specific, measurable actions with timelines",
+  "focus_questions": [
+    "哪2个指标最能证明成功?",
+    "最大的实施风险是什么?"
+  ],
+  "debate_rules": {{
+    "round1": "提出具体行动方案并提供证据支持",
+    "round2": "挑战对手最薄弱的证据",
+    "round3": "讨论伦理和实施权衡"
+  }}
+}}
+        """
+
+        try:
+            response = self._invoke_llm(prompt, use_search=False)
+            perspectives_content = _extract_content_from_response(response)
+            
+            # Parse the JSON response
+            perspectives = []
+            evidence_types = []
+            action_framework = ""
+            focus_questions = []
+            debate_rules = {}
+            
+            try:
+                import json
+                start_idx = perspectives_content.find('{')
+                end_idx = perspectives_content.rfind('}') + 1
+                if start_idx != -1 and end_idx > start_idx:
+                    json_str = perspectives_content[start_idx:end_idx]
+                    parsed_data = json.loads(json_str)
+                    
+                    perspectives = parsed_data.get("perspectives", [])
+                    evidence_types = parsed_data.get("required_evidence_types", [])
+                    action_framework = parsed_data.get("action_framework", "")
+                    focus_questions = parsed_data.get("focus_questions", [])
+                    debate_rules = parsed_data.get("debate_rules", {})
+                    
+                    logger.info(f"🎭 Generated {len(perspectives)} perspectives: {perspectives}")
+                    logger.info(f"📊 Evidence requirements: {evidence_types}")
+                else:
+                    logger.warning("No valid JSON found in perspectives response")
+                    # Fallback perspectives
+                    perspectives = ["专家支持者: 支持该主题的专业观点", "批评分析师: 质疑和挑战的观点", "实用主义者: 关注实际可行性"]
+            except Exception as e:
+                logger.warning(f"Failed to parse perspectives JSON: {e}")
+                perspectives = ["专家支持者: 支持该主题的专业观点", "批评分析师: 质疑和挑战的观点", "实用主义者: 关注实际可行性"]
+            
+            # Ensure we have valid perspectives
+            if not perspectives or len(perspectives) == 0:
+                perspectives = ["专家支持者: 支持该主题的专业观点", "批评分析师: 质疑和挑战的观点", "实用主义者: 关注实际可行性"]
+            
+            # Create perspective framework message
+            framework_message = DebateMessage(
+                agent="Debate Architect",
+                content=perspectives_content,
+                timestamp=time.time(),
+                phase=DebatePhase.EXTRACTING_REQUIREMENTS
+            )
+            
+            self._update_status("✅ Debate framework generated. Waiting for your input...", False)
+            logger.info(f"✅ Perspective generation completed with {len(perspectives)} perspectives")
+            
+            return {
+                "perspectives": perspectives,
+                "evidence_types": evidence_types,
+                "action_framework": action_framework,
+                "focus_questions": focus_questions,
+                "debate_rules": debate_rules,
+                "current_phase": DebatePhase.WAITING_FOR_INPUT,
+                "messages": [framework_message],
+                "next_action": "wait_for_input"
+            }
+            
+        except Exception as e:
+            logger.error(f"❌ Perspective generation failed: {e}")
+            self._update_status(f"❌ Error generating perspectives: {e}", False)
+            
+            error_message = DebateMessage(
+                agent="System",
+                content=f"Error generating debate framework: {e}. Using default perspectives.",
+                timestamp=time.time(),
+                phase=DebatePhase.EXTRACTING_REQUIREMENTS
+            )
+            
+            return {
+                "perspectives": ["专家支持者: 支持该主题的专业观点", "批评分析师: 质疑和挑战的观点", "实用主义者: 关注实际可行性"],
+                "evidence_types": ["学术研究", "实际案例", "专家分析"],
+                "action_framework": "具体可测量的行动方案",
+                "focus_questions": ["关键成功指标是什么?", "主要风险在哪里?"],
+                "debate_rules": {"round1": "提出方案", "round2": "质疑证据", "round3": "讨论权衡"},
+                "current_phase": DebatePhase.WAITING_FOR_INPUT,
+                "messages": [error_message],
+                "next_action": "wait_for_input"
+            }
+
+    def _decide_after_perspectives(self, state: GraphState) -> str:
+        """Decide what to do after perspective generation"""
+        # If we already have input in queue, process it immediately
+        if not self.human_input_queue.empty():
+            logger.info("📥 ROUTING: Input available after perspectives, going to process_input")
+            return "process"
+        else:
+            logger.info("⏸️ ROUTING: No input after perspectives, stopping to wait")
+            return "wait_input"
 
     def _process_input_node(self, state: GraphState) -> Dict[str, Any]:
         """Process user input and prepare for debate rounds"""
@@ -248,9 +571,11 @@ class LangChainDebateOrchestrator:
             # Step 2: Simple acknowledgment and preparation for debate
             self._update_status("✅ Input received. Preparing debate rounds...", True)
             
+            # Get dynamic perspectives from state
+            perspectives = state.get('perspectives', ['Optimist', 'Skeptic', 'Pragmatist'])
             ack_message = DebateMessage(
                 agent="System",
-                content=f"User input received. Starting debate with perspectives: {', '.join(state.get('perspectives', ['Optimist', 'Skeptic', 'Pragmatist']))}",
+                content=f"User input received. Starting debate with perspectives: {', '.join(perspectives)}",
                 timestamp=time.time(),
                 phase=DebatePhase.PROCESSING_INPUT
             )
@@ -311,10 +636,9 @@ class LangChainDebateOrchestrator:
         
         logger.info(f"🎭 Debate round {round_num}, perspective {current_index + 1}/{len(perspectives)}")
         logger.info(f"🎭 Current state: index={current_index}, total_perspectives={len(perspectives)}")
+        logger.info(f"🎭 Using perspectives: {perspectives}")
         
         try:
-            llm = self._get_llm()
-            
             if current_index < len(perspectives):
                 # Process one perspective at a time
                 perspective = perspectives[current_index]
@@ -336,35 +660,87 @@ class LangChainDebateOrchestrator:
                         "\n".join([f"{msg.agent}: {msg.content}" for msg in current_round_perspectives])
                 
                 
+                # Get debate framework from state
+                evidence_types = state.get('evidence_types', ['学术研究', '实际案例', '专家分析'])
+                action_framework = state.get('action_framework', '具体可测量的行动方案')
+                focus_questions = state.get('focus_questions', ['关键成功指标是什么?', '主要风险在哪里?'])
+                debate_rules = state.get('debate_rules', {})
+                
+                # Determine current round rules
+                round_rule = ""
+                if round_num == 1:
+                    round_rule = debate_rules.get('round1', '提出具体行动方案并提供证据支持')
+                elif round_num == 2:
+                    round_rule = debate_rules.get('round2', '挑战对手最薄弱的证据')
+                else:
+                    round_rule = debate_rules.get('round3', '讨论伦理和实施权衡')
+                
+                # Parse perspective name and belief
+                perspective_parts = perspective.split(':', 1)
+                perspective_name = perspective_parts[0].strip() if len(perspective_parts) > 0 else perspective
+                perspective_belief = perspective_parts[1].strip() if len(perspective_parts) > 1 else "专业观点"
+                
+                # Get opposing perspectives for strategic targeting
+                opposing_perspectives = [p for p in perspectives if p != perspective]
+                opposing_names = ", ".join([p.split(':')[0].strip() for p in opposing_perspectives])
+                
                 perspective_prompt = f"""
-                You are debating as a "{perspective}" perspective on the topic: "{state['topic']}"
-                
-                User's clarifying input: {state.get('user_input', '')}
-                
-                Round {round_num} of debate. You are perspective {current_index + 1} of {len(perspectives)}.
-                {prior_perspectives_text}
-                
-                Please respond in {state['language']}.
-                
-                As the {perspective} perspective, provide your viewpoint on this topic:
-                1. Your unique stance based on your perspective type
-                2. Key arguments that support your viewpoint  
-                3. Address or build upon points made by previous perspectives in this round
-                4. Provide specific examples or evidence where possible (search for current data if available)
-                5. Consider potential concerns or benefits from your perspective
-                
-                If this is not the first perspective in this round, acknowledge and engage with the previous arguments while maintaining your distinct perspective.
-                
-                Keep your response focused and substantial (2-3 paragraphs).
+**Role**: {perspective_name}  
+**Core Belief**: {perspective_belief}
+
+**Topic**: {state['topic']}
+**User Context**: {state.get('user_input', '')}
+
+## Debate Rules for Round {round_num}
+**Current Round Focus**: {round_rule}
+**Required Evidence Types**: {', '.join(evidence_types)}
+**Action Framework**: {action_framework}
+
+## Your Mission
+{prior_perspectives_text}
+
+**Round {round_num} Requirements**:
+1. **Concrete Actions First**:  
+   - Propose 2-3 actionable steps with:  
+     ✦ Quantifiable targets (e.g., "提高X指标40%在2025年前")  
+     ✦ Implementation timeline  
+2. **Evidence Depth**:  
+   - Cite 1-2 sources per claim (format: "研究名称 (年份, 期刊/机构)")  
+   - Highlight limitations of your OWN evidence  
+3. **Strategic Focus**:
+   {"- Challenge " + opposing_names + "'s evidence using methodology flaws or context gaps" if round_num > 1 else "- Build strong foundational arguments"}
+4. **Address Focus Questions**: {', '.join(focus_questions)}
+
+**Please respond in {state['language']}.**
+
+**Required Output Structure**:  
+### 行动方案:  
+1. [具体行动1] + [支持证据]  
+2. [具体行动2] + [支持证据]  
+
+### 证据分析:  
+[引用的研究/数据的局限性]
+
+{"### 质疑对手:" if round_num > 1 else "### 预期挑战:"}
+[{"针对" + opposing_names + "证据的具体质疑" if round_num > 1 else "预期会面临的质疑及应对"}]
+
+### 焦点问题回应:
+{chr(10).join([f"**{q}**: [你的回答]" for q in focus_questions])}
+
+Keep your response evidence-based, specific, and strategically positioned against opposing viewpoints.
                 """
                 
                 logger.info(f"🎭 Calling LLM for {perspective} perspective...")
-                perspective_response = llm.invoke(perspective_prompt)
+                # Most perspective debates should NOT use search - they're opinion/analysis based
+                # Only enable search if the prompt specifically asks for current data
+                needs_search = any(keyword in perspective_prompt.lower() for keyword in 
+                    ['最新', '当前', '2024', '2025', '现状', '最近', 'current', 'recent', 'latest'])
+                perspective_response = self._invoke_llm(perspective_prompt, use_search=needs_search)
                 logger.info(f"🎭 Received response from {perspective} perspective")
                 
                 perspective_message = DebateMessage(
                     agent=f"{perspective} Perspective",
-                    content=perspective_response.content,
+                    content=_extract_content_from_response(perspective_response),
                     timestamp=time.time(),
                     phase=DebatePhase.DEBATE_ROUND
                 )
@@ -421,13 +797,14 @@ class LangChainDebateOrchestrator:
                         """
                         
                         logger.info("📝 Calling LLM for moderator summary...")
-                        moderator_response = llm.invoke(moderator_prompt)
+                        # Moderator summaries should NOT use search - they summarize existing debate content
+                        moderator_response = self._invoke_llm(moderator_prompt, use_search=False)
                         logger.info("📝 Moderator summary received from LLM")
                         
                         logger.info("📝 Creating moderator message object...")
                         moderator_message = DebateMessage(
                             agent=f"Round {round_num} Moderator Summary",
-                            content=moderator_response.content,
+                            content=_extract_content_from_response(moderator_response),
                             timestamp=time.time(),
                             phase=DebatePhase.MODERATOR_DECISION  # Changed to MODERATOR_DECISION so it persists
                         )
@@ -503,41 +880,69 @@ class LangChainDebateOrchestrator:
         self._update_status("🧑‍⚖️ Moderator analyzing debate progress...", True)
         
         try:
-            llm = self._get_llm()
-            
             # Build recent debate context
             recent_messages = state.get('messages', [])[-15:]  # Last 15 messages for better context
             debate_context = "\n\n".join([f"{msg.agent}: {msg.content}" for msg in recent_messages if msg.phase == DebatePhase.DEBATE_ROUND])
             
+            # Get debate framework for evidence evaluation
+            evidence_types = state.get('evidence_types', ['学术研究', '实际案例', '专家分析'])
+            focus_questions = state.get('focus_questions', ['关键成功指标是什么?', '主要风险在哪里?'])
+            
             decision_prompt = f"""
-            You are the debate moderator analyzing round {round_num} of a debate on "{state['topic']}".
-            
-            Current round: {round_num}/{max_rounds}
-            
-            Debate content from this round:
-            {debate_context}
-            
-            Please respond in {state['language']}.
-            
-            As the moderator, analyze the debate and make one of these decisions:
-            
-            1. CLARIFY - If you need more clarifying questions answered before proceeding (rare - ask 1-3 specific questions)
-            2. ANOTHER_ROUND - If significant disagreement remains and more rounds would be helpful (identify key disagreement to focus on)
-            3. VOTE - If the debate has explored key points sufficiently, time for final assessment and voting
-            4. CONSENSUS - If all perspectives generally agree on the main points
-            
-            If choosing ANOTHER_ROUND, identify the specific point of disagreement to focus the next round on.
-            If choosing CLARIFY, this should be rare - only when critical information is missing.
-            
-            Format:
-            DECISION: [CLARIFY|ANOTHER_ROUND|VOTE|CONSENSUS]
-            REASONING: [Your explanation]
-            FOCUS: [Only if ANOTHER_ROUND - the specific disagreement point to debate next]
-            QUESTIONS: [Only if CLARIFY - list specific questions, one per line]
+**Role**: Debate Referee & Evidence Evaluator
+**Topic**: "{state['topic']}"
+**Round**: {round_num}/{max_rounds}
+
+## Evidence Quality Analysis
+**Required Evidence Types**: {', '.join(evidence_types)}
+**Focus Questions**: {', '.join(focus_questions)}
+
+## Debate Content to Analyze:
+{debate_context}
+
+## Your Tasks:
+1. **Evidence Quality Scoring** (per perspective):
+   - RCT/Meta-analysis = 5 points  
+   - Observational study = 3 points  
+   - Expert opinion/case study = 1 point
+   - Unsupported claims = 0 points
+
+2. **Conflict Assessment**:
+   - Identify strongest disagreements
+   - Check if evidence directly challenges opposing claims
+   - Note any gaps in argumentation
+
+3. **Depth Evaluation**:
+   - Are concrete actions proposed with timelines?
+   - Are evidence limitations acknowledged?
+   - Are focus questions adequately addressed?
+
+## Decision Rules:
+- **ANOTHER_ROUND**: If evidence scores differ by 3+ points OR major disagreement on implementation
+- **CLARIFY**: If critical evidence is missing for key claims (rare)
+- **VOTE**: If sufficient evidence presented and clear positions established  
+- **CONSENSUS**: If all perspectives agree on main actions (rare)
+
+## Required Output Format:
+**EVIDENCE SCORES**:
+[Perspective1]: [X]/5 points - [brief evidence assessment]
+[Perspective2]: [X]/5 points - [brief evidence assessment]
+
+**CONFLICT ANALYSIS**:
+- Strongest disagreement: [specific point]
+- Evidence gaps: [what's missing]
+
+**DECISION**: [CLARIFY|ANOTHER_ROUND|VOTE|CONSENSUS]
+**REASONING**: [Evidence-based explanation focusing on quality and completeness]
+**FOCUS**: [If ANOTHER_ROUND - specific evidence gap or methodological flaw to address]
+**QUESTIONS**: [If CLARIFY - specific evidence needed]
+
+Please respond in {state['language']}.
             """
             
-            decision_response = llm.invoke(decision_prompt)
-            decision_content = decision_response.content
+            # Moderator decisions should NOT use search - they analyze existing debate content
+            decision_response = self._invoke_llm(decision_prompt, use_search=False)
+            decision_content = _extract_content_from_response(decision_response)
             
             # Parse decision
             decision = "VOTE"  # Default
@@ -582,11 +987,12 @@ class LangChainDebateOrchestrator:
                 Format your summary as bullet points with key points, disagreements, and compelling arguments.
                 """
                 
-                summary_response = llm.invoke(summary_prompt)
+                # Fallback summaries should NOT use search - they summarize existing content
+                summary_response = self._invoke_llm(summary_prompt, use_search=False)
                 
                 summary_message = DebateMessage(
                     agent=f"Round {round_num} Moderator Summary",
-                    content=summary_response.content,
+                    content=_extract_content_from_response(summary_response),
                     timestamp=time.time(),
                     phase=DebatePhase.MODERATOR_DECISION
                 )
@@ -701,8 +1107,6 @@ class LangChainDebateOrchestrator:
         self._update_status("🗳️ Conducting final consensus assessment...", True)
         
         try:
-            llm = self._get_llm()
-            
             # Build full debate context including round summaries
             all_messages = state.get('messages', [])
             debate_context = "\n\n".join([f"{msg.agent}: {msg.content}" for msg in all_messages if msg.phase in [DebatePhase.DEBATE_ROUND, DebatePhase.PROCESSING_INPUT, DebatePhase.MODERATOR_DECISION]])
@@ -744,10 +1148,11 @@ class LangChainDebateOrchestrator:
             Structure your response as a complete answer to "{state['topic']}" that the user can understand and use.
             """
             
-            voting_response = llm.invoke(voting_prompt)
+            # Final voting should NOT use search - it synthesizes the debate that already happened
+            voting_response = self._invoke_llm(voting_prompt, use_search=False)
             
             # Parse voting results
-            voting_content = voting_response.content
+            voting_content = _extract_content_from_response(voting_response)
             confidence = 75  # Default confidence
             consensus = False
             
@@ -922,8 +1327,13 @@ class LangChainDebateOrchestrator:
                     
                     return True  # Continue processing
             
-            # Handle different phases directly to avoid restarting from entry point
-            if current_phase == DebatePhase.EXTRACTING_REQUIREMENTS:
+            # Handle different phases and actions directly to avoid restarting from entry point
+            next_action = self.state.get('next_action', 'none')
+            
+            if current_phase == DebatePhase.EXTRACTING_REQUIREMENTS and next_action == "generate_perspectives":
+                logger.info(f"🚀 INVOKING GENERATE_PERSPECTIVES NODE")
+                result = self._generate_perspectives_node(self.state)
+            elif current_phase == DebatePhase.EXTRACTING_REQUIREMENTS:
                 logger.info(f"🚀 INVOKING EXTRACT_REQUIREMENTS NODE")
                 result = self._extract_requirements_node(self.state)
             elif current_phase == DebatePhase.PROCESSING_INPUT:

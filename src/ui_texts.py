@@ -46,6 +46,9 @@ class UITexts:
         self.OPENAI_MODEL = "OpenAI 模型"
         self.GEMINI_MODEL = "Gemini 模型"
         self.DEEPSEEK_MODEL = "DeepSeek 模型"
+        self.TEMPERATURE = "温度"
+        self.THINKING_MODE = "思考模式"
+        self.THINKING_MODE_HELP = "启用类似 O1 的推理模式（适用于支持的模型）"
         
         # 语言选项
         self.DISCUSSION_LANGUAGE = "讨论语言"
@@ -143,6 +146,13 @@ class UITexts:
         
         # 调试信息
         self.CURRENT_PHASE_DEBUG = "当前阶段："
+        
+        # 搜索状态
+        self.SEARCH_STATUS = "🔍 搜索状态"
+        self.SEARCH_ENABLED = "搜索已启用"
+        self.SEARCH_DISABLED = "搜索已禁用"
+        self.SEARCH_REQUIREMENTS = "搜索需求"
+        self.SEARCH_REQUIREMENTS_INFO = "**Gemini:** 内置搜索功能\n\n**OpenAI/DeepSeek:** 需要设置 `TAVILY_API_KEY` 环境变量"
     
     def _load_english(self):
         """加载英文文字"""
@@ -166,6 +176,9 @@ class UITexts:
         self.OPENAI_MODEL = "OpenAI Model"
         self.GEMINI_MODEL = "Gemini Model"
         self.DEEPSEEK_MODEL = "DeepSeek Model"
+        self.TEMPERATURE = "Temperature"
+        self.THINKING_MODE = "Thinking Mode"
+        self.THINKING_MODE_HELP = "Enable O1-style reasoning mode (for supported models)"
         
         # 语言选项
         self.DISCUSSION_LANGUAGE = "Discussion Language"
@@ -263,6 +276,13 @@ class UITexts:
         
         # 调试信息
         self.CURRENT_PHASE_DEBUG = "Current phase:"
+        
+        # 搜索状态
+        self.SEARCH_STATUS = "🔍 Search Status"
+        self.SEARCH_ENABLED = "Search enabled"
+        self.SEARCH_DISABLED = "Search disabled"
+        self.SEARCH_REQUIREMENTS = "Search Requirements"
+        self.SEARCH_REQUIREMENTS_INFO = "**Gemini:** Built-in search capability\n\n**OpenAI/DeepSeek:** Requires `TAVILY_API_KEY` environment variable"
 
 # 创建全局实例，默认中文
 ui_texts = UITexts("chinese")

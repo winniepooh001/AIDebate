@@ -6,7 +6,7 @@ LLM_MODEL_LIST = {
          "o4-mini", "o4-mini-high",
          "o3", "o3-mini", "o3-mini-high", "o3-pro",
          "o1", "o1-mini", "o1-pro", "o1-preview",
-         "gpt4o", "gpt-4o-mini",
+         "gpt-4o", "gpt-4o-mini",
          "gpt-3.5"
     ],
     "deepseek": ["deepseek-chat",

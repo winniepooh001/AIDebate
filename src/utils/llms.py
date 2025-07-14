@@ -10,6 +10,18 @@ from src.config import LLMProvider, get_env_api_key
 from src.utils.logger import logger
 import os
 
+try:
+    from google.ai.generativelanguage_v1beta.types import Tool as GenAITool
+except ImportError:
+    GenAITool = None
+    logger.warning("Google generativelanguage_v1beta not available - search will be disabled for Gemini")
+
+try:
+    from langchain_community.tools.tavily_search import TavilySearchResults
+except ImportError:
+    TavilySearchResults = None
+    logger.warning("Tavily search not available - search will be disabled for OpenAI/DeepSeek")
+
 class LLMManager:
     def __init__(self):
         logger.debug("initiate LLM Manager")
@@ -17,6 +29,9 @@ class LLMManager:
         self.current_provider_index = 0
         self.provider_order: List[LLMProvider] = []
         self.provider_stats: Dict[LLMProvider, Dict] = {}
+        self.search_enabled: Dict[LLMProvider, bool] = {}
+        self.thinking_mode: Dict[LLMProvider, bool] = {}
+        self.provider_configs: Dict[LLMProvider, Dict] = {}
 
 
     def add_provider(self, provider_type: LLMProvider, **kwargs) -> bool:
@@ -25,26 +40,81 @@ class LLMManager:
             api_key = kwargs.get('api_key') or get_env_api_key(provider_type)
             if not api_key:
                 raise ValueError(f"{provider_type.value} API key not found")
+            
+            # Store configuration
+            thinking_mode = kwargs.get('thinking_mode', False)
+            temperature = kwargs.get('temperature', 0.7)
+            model = kwargs.get('model')
+            
+            self.thinking_mode[provider_type] = thinking_mode
+            self.provider_configs[provider_type] = {
+                'model': model,
+                'temperature': temperature,
+                'thinking_mode': thinking_mode
+            }
 
             llm = None
             if provider_type == LLMProvider.OPENAI:
                 llm = ChatOpenAI(
                     api_key=api_key,
-                    model=kwargs.get('model', 'gpt-4o-mini'),
-                    temperature=kwargs.get('temperature', 0.7)
+                    model=model or 'gpt-4o-mini',
+                    temperature=temperature
                 )
+                
+                # Bind Tavily search tool if available
+                if TavilySearchResults is not None and os.getenv("TAVILY_API_KEY"):
+                    try:
+                        search_tool = TavilySearchResults(max_results=5)
+                        llm = llm.bind_tools([search_tool])
+                        self.search_enabled[provider_type] = True
+                        logger.info(f"Tavily search tool bound to {provider_type.value}")
+                    except Exception as e:
+                        logger.warning(f"Failed to bind Tavily search tool to {provider_type.value}: {e}")
+                        self.search_enabled[provider_type] = False
+                else:
+                    self.search_enabled[provider_type] = False
+                    if not os.getenv("TAVILY_API_KEY"):
+                        logger.info(f"TAVILY_API_KEY not found - search disabled for {provider_type.value}")
             elif provider_type == LLMProvider.GEMINI:
                 llm = ChatGoogleGenerativeAI(
                     google_api_key=api_key,
-                    model=kwargs.get('model', 'gemini-2.5-pro'),
-                    temperature=kwargs.get('temperature', 0.7)
+                    model=model or 'gemini-2.5-pro',
+                    temperature=temperature
                 )
+                
+                # Bind Google Search tool if available
+                if GenAITool is not None:
+                    try:
+                        search_tool = GenAITool(google_search={})
+                        llm = llm.bind_tools([search_tool])
+                        self.search_enabled[provider_type] = True
+                        logger.info(f"Google Search tool bound to {provider_type.value}")
+                    except Exception as e:
+                        logger.warning(f"Failed to bind search tool to {provider_type.value}: {e}")
+                        self.search_enabled[provider_type] = False
+                else:
+                    self.search_enabled[provider_type] = False
             elif provider_type == LLMProvider.DEEPSEEK:
                 llm = ChatDeepSeek(
                     api_key=api_key,
-                    model=kwargs.get('model', 'deepseek-chat'),
-                    temperature=kwargs.get('temperature', 0.7)
+                    model=model or 'deepseek-chat',
+                    temperature=temperature
                 )
+                
+                # Bind Tavily search tool if available
+                if TavilySearchResults is not None and os.getenv("TAVILY_API_KEY"):
+                    try:
+                        search_tool = TavilySearchResults(max_results=5)
+                        llm = llm.bind_tools([search_tool])
+                        self.search_enabled[provider_type] = True
+                        logger.info(f"Tavily search tool bound to {provider_type.value}")
+                    except Exception as e:
+                        logger.warning(f"Failed to bind Tavily search tool to {provider_type.value}: {e}")
+                        self.search_enabled[provider_type] = False
+                else:
+                    self.search_enabled[provider_type] = False
+                    if not os.getenv("TAVILY_API_KEY"):
+                        logger.info(f"TAVILY_API_KEY not found - search disabled for {provider_type.value}")
 
             self.providers[provider_type] = llm
 
@@ -107,3 +177,28 @@ class LLMManager:
         """Check if a provider is available"""
         return provider_name in self.get_available_providers()
     
+    def is_search_enabled(self, provider_type: LLMProvider) -> bool:
+        """Check if search is enabled for a provider"""
+        return self.search_enabled.get(provider_type, False)
+    
+    def get_search_status(self) -> Dict[str, bool]:
+        """Get search status for all providers"""
+        status = {}
+        for provider_type in self.provider_order:
+            status[provider_type.value] = self.is_search_enabled(provider_type)
+        return status
+    
+    def is_thinking_mode_enabled(self, provider_type: LLMProvider) -> bool:
+        """Check if thinking mode is enabled for a provider"""
+        return self.thinking_mode.get(provider_type, False)
+    
+    def get_thinking_status(self) -> Dict[str, bool]:
+        """Get thinking mode status for all providers"""
+        status = {}
+        for provider_type in self.provider_order:
+            status[provider_type.value] = self.is_thinking_mode_enabled(provider_type)
+        return status
+    
+    def get_provider_config(self, provider_type: LLMProvider) -> Dict:
+        """Get configuration for a provider"""
+        return self.provider_configs.get(provider_type, {})
